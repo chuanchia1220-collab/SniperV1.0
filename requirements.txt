@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+yfinance
+fugle-marketdata
+twstock
+lxml
+requests
+pandas_ta
+plotly
+openai
+kaleido
+colorama
+mplfinance
+matplotlib

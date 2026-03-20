@@ -13,3 +13,5 @@ kaleido
 colorama
 mplfinance
 matplotlib
+gspread 
+oauth2client

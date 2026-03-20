@@ -1,3 +1,6 @@
+import os
+# 關閉 Streamlit 的檔案監視功能，避免觸發 inotify limit 報錯
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -11,8 +14,37 @@ import logging
 import numpy as np
 import math
 from bs4 import BeautifulSoup
+import traceback
+import platform
+import pandas_ta as ta
+from collections import deque
+import gspread
+from google.oauth2.service_account import Credentials
 
-# [FIX] Colorama 防呆機制
+# ==========================================
+# [系統除錯機制] 全域日誌
+# ==========================================
+sys_debug_logs = deque(maxlen=50)
+
+def log_debug(msg):
+    ts = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M:%S')
+    full_msg = f"[{ts}] {msg}"
+    print(full_msg)
+    sys_debug_logs.appendleft(full_msg)
+
+# ==========================================
+# [雲端專屬防護] 最大化系統連線上限
+# ==========================================
+if platform.system() != "Windows":
+    try:
+        import resource
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit < hard_limit:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+            log_debug(f"✅ System FD limit raised to {hard_limit}")
+    except Exception as e:
+        log_debug(f"⚠️ System FD limit adjust failed: {e}")
+
 try:
     import colorama
     from colorama import Fore, Style
@@ -23,36 +55,32 @@ except ImportError:
     Fore = Style = MockColor()
     colorama = None
 
-# [LOG FIX] Silence yfinance and other non-critical warnings
 warnings.filterwarnings("ignore")
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 pd.set_option('future.no_silent_downcasting', True)
 
 # ==========================================
-# 0. Global Strategy Config (Strictly synced)
+# 0. Global Strategy Config
 # ==========================================
-MIN_AMPLITUDE_THRESHOLD = 4.0  # 瘋狗股判定標準
+MIN_AMPLITUDE_THRESHOLD = 4.0 
 
-# [🅰️ 瘋狗股參數]
 MAD_DOG_PARAMS = {
-    'TARGET_WAVE': 2,           # 只做第 2 波
+    'TARGET_WAVE': 2,            
     'MAX_TRADES_DAY': 2,
     'ENTRY_CEILING_PCT': 4.0,   
     'STOP_LOSS_PCT': 2.0,
     'MAX_DAY_PCT': 3.5          
 }
 
-# [🅱️ 常規股參數]
 NORMAL_PARAMS = {
-    'TARGET_WAVE': 0,           
+    'TARGET_WAVE': 0,            
     'MAX_TRADES_DAY': 2,
     'ENTRY_CEILING_PCT': 2.0,   
     'STOP_LOSS_PCT': 0.0,
     'MAX_DAY_PCT': 2.5          
 }
 
-# [共通設定]
-ENTRY_THRESHOLD_PCT = 0.5       # 啟動: VWAP + 0.5%
+ENTRY_THRESHOLD_PCT = 0.5   
 TRIGGER_PCT = 1.5
 TRAILING_CALLBACK = 1.0
 PERIOD = "60d"
@@ -61,25 +89,24 @@ INTERVAL = "5m"
 # ==========================================
 # 1. Config & Domain Models
 # ==========================================
-st.set_page_config(page_title="Sniper v6.16.15 BuySignal", page_icon="⚔️", layout="wide")
+st.set_page_config(page_title="Sniper AI Commander", page_icon="🤖", layout="wide")
 
 try:
     raw_fugle_keys = st.secrets.get("Fugle_API_Key", "")
     TG_BOT_TOKEN = st.secrets.get("TG_BOT_TOKEN", "")
     TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
+    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 except:
     raw_fugle_keys = os.getenv("Fugle_API_Key", "")
     TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
     TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 API_KEYS = [k.strip() for k in raw_fugle_keys.split(',') if k.strip()]
 DB_PATH = "sniper_v616.db"
 
-DEFAULT_WATCHLIST = "3006 3037 1513 3189 1795 3491 8046 6274"
-DEFAULT_INVENTORY = """2481,84.4,3
-3231,150.14,7
-4566,54.94,2
-8046,252.64,7"""
+DEFAULT_WATCHLIST = "3037 1513 4566"
+DEFAULT_INVENTORY = """4566"""
 
 @dataclass
 class SniperEvent:
@@ -99,19 +126,15 @@ class SniperEvent:
     tp_price: float
     sl_price: float
     win_rate: float
+    twii_slope: float = 0.0  
+    rsi: float = 0.0
+    band_ratio: float = 0.0
+    b_percent: float = 0.0
+    control_ratio: float = 0.0
+    is_snapshot: bool = False
     timestamp: float = field(default_factory=time.time)
     data_status: str = "DATA_OK"
     is_test: bool = False
-
-# ==========================================
-# 2. Market Session
-# ==========================================
-class MarketSession:
-    MARKET_OPEN, MARKET_CLOSE = dt_time(9, 0), dt_time(13, 35)
-    @staticmethod
-    def is_market_open(now=None):
-        if not now: now = datetime.now(timezone.utc) + timedelta(hours=8)
-        return MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
 
 # ==========================================
 # 3. Database
@@ -120,60 +143,149 @@ class Database:
     def __init__(self, db_path):
         self.db_path = db_path
         self.write_queue = queue.Queue()
+        self.gs_sheet = None
         self._init_db()
-        threading.Thread(target=self._writer_loop, daemon=True).start()
+        threading.Thread(target=self._writer_loop, daemon=True, name="DBWriterThread").start()
+        threading.Thread(target=self._init_google_sheets, daemon=True).start()
+
+    def _init_google_sheets(self):
+        # 如果已經連線成功，就不要再跑一次
+        if hasattr(self, 'gs_client') and self.gs_client:
+            return
+        try:
+            from google.oauth2.service_account import Credentials # 確保導入
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            
+            # --- 優先嘗試從 Streamlit Secrets 讀取 (雲端環境) ---
+            if "gcp_service_account" in st.secrets:
+                creds_info = dict(st.secrets["gcp_service_account"])
+                # --- 自動修復 PEM 格式中的換行問題 ---
+                if "private_key" in creds_info:
+                    creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+                
+                creds = Credentials.from_service_account_info(creds_info, scopes=scope)
+                self.gs_client = gspread.authorize(creds)
+                log_debug("☁️ Google Sheets 連線成功 (格式已自動校準)")
+            
+            # --- 次要嘗試從本地檔案讀取 (本地測試環境) ---
+            elif os.path.exists("service_account.json"):
+                from oauth2client.service_account import ServiceAccountCredentials # 確保本地相容導入
+                creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+                self.gs_client = gspread.authorize(creds)
+                log_debug("☁️ Google Sheets 連線成功 (透過本地 JSON)")
+            
+            else:
+                log_debug("⚠️ 找不到憑證資訊，雲端同步關閉")
+                return
+
+            # 開啟試算表
+            self.gs_sheet = self.gs_client.open_by_url("https://docs.google.com/spreadsheets/d/1cmB7osByPJeSA7Zz71K21xM5L2X1xMaHAYeEcYkVZfU/edit?usp=sharing").sheet1
+            
+        except Exception as e:
+            log_debug(f"⚠️ Google Sheets 初始化失敗: {e}")
 
     def _get_conn(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        for _ in range(3):
+            try: return sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+            except sqlite3.OperationalError: time.sleep(1)
+        return sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
 
     def _init_db(self):
-        conn = self._get_conn(); c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL', situation TEXT, ratio_yest REAL, active_light INTEGER DEFAULT 0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0, avg_amp REAL DEFAULT 0)''')
-        
-        try: c.execute("ALTER TABLE static_info ADD COLUMN avg_amp REAL DEFAULT 0")
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS realtime (code TEXT PRIMARY KEY, name TEXT, category TEXT, price REAL, pct REAL, vwap REAL, vol REAL, est_vol REAL, ratio REAL, net_1h REAL, net_10m REAL, net_day REAL, signal TEXT, update_time REAL, data_status TEXT DEFAULT 'DATA_OK', signal_level TEXT DEFAULT 'B', risk_status TEXT DEFAULT 'NORMAL', situation TEXT, ratio_yest REAL, active_light INTEGER DEFAULT 0, rsi REAL DEFAULT 0, band_ratio REAL DEFAULT 0, b_percent REAL DEFAULT 0)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS inventory (code TEXT PRIMARY KEY, cost REAL, qty REAL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS pinned (code TEXT PRIMARY KEY)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS static_info (code TEXT PRIMARY KEY, vol_5ma REAL, vol_yest REAL, price_5ma REAL, win_rate REAL DEFAULT 0, avg_ret REAL DEFAULT 0, avg_amp REAL DEFAULT 0)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS telegram_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_time TEXT, code TEXT, name TEXT, signal TEXT, price REAL, vwap REAL, net_10m INTEGER, net_1h INTEGER, net_day INTEGER, twii_slope REAL, rsi REAL, band_ratio REAL, b_percent REAL, ratio REAL, control_ratio REAL)''')
+
+            try: c.execute("ALTER TABLE static_info ADD COLUMN avg_amp REAL DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN ratio REAL DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE telegram_logs ADD COLUMN control_ratio REAL DEFAULT 0")
+            except: pass
+            
+            conn.commit(); conn.close()
+        except Exception as e: log_debug(f"⚠️ [DB Init Error] {e}")
+
+    def log_telegram(self, event: SniperEvent):
+        time_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+        sql = 'INSERT INTO telegram_logs (log_time, code, name, signal, price, vwap, net_10m, net_1h, net_day, twii_slope, rsi, band_ratio, b_percent, ratio, control_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        args = (time_str, event.code, event.name, event.event_label, event.price, event.vwap,
+                event.net_10m, event.net_1h, event.net_day, event.twii_slope,
+                event.rsi, event.band_ratio, event.b_percent, event.ratio, event.control_ratio)
+        self.write_queue.put(('execute', sql, args))
+
+        if self.gs_sheet:
+            threading.Thread(target=lambda: self._safe_gs_write(args), daemon=True).start()
+
+    def _safe_gs_write(self, row):
+        try: self.gs_sheet.append_row(list(row))
         except: pass
-        try: c.execute("ALTER TABLE realtime ADD COLUMN active_light INTEGER DEFAULT 0")
-        except: pass
-        
-        conn.commit(); conn.close()
+
+    def get_telegram_logs(self):
+        try:
+            conn = self._get_conn()
+            df = pd.read_sql('SELECT log_time as 時間, code as 代碼, name as 名稱, signal as 訊號, price as 價格, vwap as 均價, net_10m as 大戶10M, net_1h as 大戶1H, net_day as 大戶日, ratio as 量比, control_ratio as 控盤比, twii_slope as 大盤斜率, rsi as RSI, band_ratio as 帶寬比, b_percent as 布林極限 FROM telegram_logs ORDER BY id ASC', conn)
+            conn.close(); return df
+        except: return pd.DataFrame()
+
+    def get_watchlist_view(self):
+        try:
+            conn = self._get_conn()
+            query = '''SELECT w.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, r.active_light, r.rsi, r.band_ratio, r.b_percent, s.price_5ma, s.win_rate, s.avg_ret, s.avg_amp, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
+            df = pd.read_sql(query, conn); conn.close(); return df
+        except: return pd.DataFrame()
+
+    def get_inventory_view(self):
+        try:
+            conn = self._get_conn()
+            query = '''SELECT i.code, r.name, r.vol, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_1h, r.net_day, r.situation, s.price_5ma, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
+            df = pd.read_sql(query, conn); conn.close(); return df
+        except: return pd.DataFrame()
 
     def _writer_loop(self):
         conn = self._get_conn(); cursor = conn.cursor()
         while True:
             try:
-                tasks = []
-                try: tasks.append(self.write_queue.get(timeout=0.1))
-                except queue.Empty: continue
-                while not self.write_queue.empty() and len(tasks) < 50: tasks.append(self.write_queue.get())
-                for task_type, sql, args in tasks:
-                    try:
-                        if task_type == 'executemany': cursor.executemany(sql, args)
-                        else: cursor.execute(sql, args)
-                    except: pass
+                task = self.write_queue.get(timeout=5.0)
+                task_type, sql, args = task
+                if task_type == 'executemany': cursor.executemany(sql, args)
+                else: cursor.execute(sql, args)
                 conn.commit()
-                for _ in tasks: self.write_queue.task_done()
-            except: time.sleep(1)
+            except queue.Empty: continue
+            except Exception as e: log_debug(f"⚠️ DB Write Error: {e}")
 
-    def upsert_realtime_batch(self, data_list):
-        if not data_list: return
-        sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, est_vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m, situation, ratio_yest, active_light) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
-        self.write_queue.put(('executemany', sql, data_list))
+    def get_volume_map(self):
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('SELECT code, vol_5ma, vol_yest, price_5ma, win_rate, avg_amp FROM static_info')
+            rows = c.fetchall(); conn.close()
+            return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3], 'win_rate': r[4], 'avg_amp': r[5]} for r in rows}
+        except: return {}
 
-    def upsert_static(self, data_list):
-        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        self.write_queue.put(('executemany', sql, data_list))
+    def get_all_codes(self):
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('SELECT code FROM inventory UNION SELECT code FROM watchlist UNION SELECT code FROM pinned')
+            rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
+        except: return []
 
-    def update_inventory_list(self, inventory_text):
-        self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
-        for line in inventory_text.split('\n'):
-            parts = line.split(',')
-            if len(parts) >= 2:
-                try: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, ?, ?)', (parts[0].strip(), float(parts[1].strip()), float(parts[2].strip()) if len(parts) > 2 else 1.0)))
-                except: pass
+    def get_inventory_codes(self):
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('SELECT code FROM inventory')
+            rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
+        except: return []
+
+    def get_pinned_codes(self):
+        try:
+            conn = self._get_conn(); c = conn.cursor()
+            c.execute('SELECT code FROM pinned')
+            rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
+        except: return []
 
     def update_watchlist(self, codes_text):
         self.write_queue.put(('execute', 'DELETE FROM watchlist', ()))
@@ -181,45 +293,38 @@ class Database:
         for t in targets: self.write_queue.put(('execute', 'INSERT OR REPLACE INTO watchlist (code) VALUES (?)', (t,)))
         return targets
 
-    def get_watchlist_view(self):
-        conn = self._get_conn()
-        query = '''SELECT w.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_10m, r.net_1h, r.net_day, r.situation, r.active_light, s.price_5ma, s.win_rate, s.avg_ret, s.avg_amp, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM watchlist w LEFT JOIN realtime r ON w.code = r.code LEFT JOIN static_info s ON w.code = s.code LEFT JOIN pinned p ON w.code = p.code'''
-        df = pd.read_sql(query, conn)
-        conn.close(); return df
+    def update_inventory_list(self, inventory_text):
+        self.write_queue.put(('execute', 'DELETE FROM inventory', ()))
+        raw_items = inventory_text.replace('\n', ' ').replace(',', ' ').split()
+        for code in raw_items:
+            if code.strip(): self.write_queue.put(('execute', 'INSERT OR REPLACE INTO inventory (code, cost, qty) VALUES (?, 0.0, 1.0)', (code.strip(),)))
 
-    def get_inventory_view(self):
-        conn = self._get_conn()
-        query = '''SELECT i.code, r.name, r.pct, r.price, r.vwap, r.ratio, r.ratio_yest, r.signal as event_label, r.net_1h, r.net_day, r.situation, s.price_5ma, i.cost, i.qty, (r.price - i.cost) * i.qty * 1000 as profit_val, (r.price - i.cost) / i.cost * 100 as profit_pct, CASE WHEN p.code IS NOT NULL THEN 1 ELSE 0 END as is_pinned, r.data_status, r.risk_status, r.signal_level FROM inventory i LEFT JOIN realtime r ON i.code = r.code LEFT JOIN static_info s ON i.code = s.code LEFT JOIN pinned p ON i.code = p.code'''
-        df = pd.read_sql(query, conn)
-        conn.close(); return df
+    def upsert_realtime_batch(self, data_list):
+        if not data_list: return
+        sql = '''INSERT OR REPLACE INTO realtime (code, name, category, price, pct, vwap, vol, est_vol, ratio, net_1h, net_day, signal, update_time, data_status, signal_level, risk_status, net_10m, situation, ratio_yest, active_light, rsi, band_ratio, b_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
+        self.write_queue.put(('executemany', sql, data_list))
 
-    def get_all_codes(self):
-        conn = self._get_conn(); c = conn.cursor()
-        c.execute('SELECT code FROM inventory UNION SELECT code FROM watchlist UNION SELECT code FROM pinned')
-        rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
+    def upsert_static(self, data_list):
+        sql = 'INSERT OR REPLACE INTO static_info (code, vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        self.write_queue.put(('executemany', sql, data_list))
 
-    def get_inventory_codes(self):
-        conn = self._get_conn(); c = conn.cursor()
-        c.execute('SELECT code FROM inventory')
-        rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
-
-    def get_pinned_codes(self):
-        conn = self._get_conn(); c = conn.cursor()
-        c.execute('SELECT code FROM pinned')
-        rows = c.fetchall(); conn.close(); return [r[0] for r in rows]
-
-    def get_volume_map(self):
-        conn = self._get_conn(); c = conn.cursor()
-        c.execute('SELECT code, vol_5ma, vol_yest, price_5ma, win_rate, avg_amp FROM static_info')
-        rows = c.fetchall(); conn.close()
-        return {r[0]: {'vol_5ma': r[1], 'vol_yest': r[2], 'price_5ma': r[3], 'win_rate': r[4], 'avg_amp': r[5]} for r in rows}
 
 db = Database(DB_PATH)
 
 # ==========================================
+# 2. Market Session (修正假日判斷)
+# ==========================================
+class MarketSession:
+    MARKET_OPEN, MARKET_CLOSE = dt_time(9, 0), dt_time(13, 35)
+    @staticmethod
+    def is_market_open(now=None):
+        if not now: now = datetime.now(timezone.utc) + timedelta(hours=8)
+        # 嚴格判斷：必須是週一到週五 (weekday 0~4)
+        return now.weekday() < 5 and MarketSession.MARKET_OPEN <= now.time() <= MarketSession.MARKET_CLOSE
+
+# ==========================================
 # 4. Utilities
 # ==========================================
-
 def adjust_to_tick(price, method='floor'):
     if price < 10: tick = 0.01
     elif price < 50: tick = 0.05
@@ -228,20 +333,14 @@ def adjust_to_tick(price, method='floor'):
     elif price < 1000: tick = 1.0
     else: tick = 5.0
     
-    if method == 'round':
-        return round(price / tick) * tick
-    else:
-        return math.floor(price / tick) * tick
+    if method == 'round': return round(price / tick) * tick
+    else: return math.floor(price / tick) * tick
 
 def _calculate_intraday_vwap(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df.index = pd.to_datetime(df.index)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
-    else:
-        df.index = df.index.tz_convert('Asia/Taipei')
+    if df.index.tz is None: df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+    else: df.index = df.index.tz_convert('Asia/Taipei')
 
     df['Date'] = df.index.date
     df['TP_Vol'] = df['Close'] * df['Volume']
@@ -250,11 +349,7 @@ def _calculate_intraday_vwap(df):
     df['VWAP'] = df['Cum_Val'] / df['Cum_Vol']
     return df
 
-# === 終端機/網頁版共用回測邏輯 ===
 def _run_core_backtest(df, params):
-    """
-    核心回測運算 (含波次時間冷卻邏輯)
-    """
     results = []
     wins, losses = 0, 0
     unique_dates = sorted(list(set(df.index.date)))
@@ -273,38 +368,26 @@ def _run_core_backtest(df, params):
         in_pos = False
         entry_p = 0; entry_v = 0
         daily_executed_trades = 0
-        
-        # 波次計數器 (Daily Reset)
-        wave_count = 0
-        last_wave_ts = 0
-        is_holding_wave = False
+        wave_count = 0; last_wave_ts = 0; is_holding_wave = False
         
         try: yesterday_close = day_data['Close'].iloc[0] 
         except: continue
-
         max_p_after_entry = 0; trailing_active = False
 
         for ts, row in day_data.iterrows():
-            p = float(row['Close'])
-            v = float(row['VWAP'])
-            t = ts.time()
-            curr_ts = ts.timestamp()
-
+            p = float(row['Close']); v = float(row['VWAP']); t = ts.time(); curr_ts = ts.timestamp()
             if daily_executed_trades >= params['MAX_TRADES_DAY']: break
 
-            # 1. 更新波次 (Time Cool-down Logic)
             entry_line = v * ENTRY_THRESHOLD
             if p >= entry_line:
                 if not is_holding_wave:
-                    # 剛突破，檢查冷卻
-                    if (curr_ts - last_wave_ts) > 300: # 5 mins
+                    if (curr_ts - last_wave_ts) > 300:
                         wave_count += 1
                         last_wave_ts = curr_ts
                 is_holding_wave = True
             else:
                 is_holding_wave = False
 
-            # 2. 進場邏輯
             if not in_pos:
                 if t.hour == 9 and t.minute < 10: continue
                 if t.hour >= 13: continue
@@ -323,7 +406,6 @@ def _run_core_backtest(df, params):
                             max_p_after_entry = p
                             trailing_active = False
 
-            # 3. 出場邏輯
             elif in_pos:
                 exit_price = 0
                 if p <= entry_v * STOP_LOSS: exit_price = p
@@ -346,7 +428,6 @@ def _run_core_backtest(df, params):
 
     return results, wins, losses
 
-# 網頁版用的快速回測
 def _run_quick_backtest(target_code):
     try:
         if target_code.isdigit(): target_code += ".TW"
@@ -392,7 +473,6 @@ def fetch_static_stats(client, code):
             price_5ma = float(last_5_days['Close'].mean())
 
         win_rate, avg_ret, avg_amp = _run_quick_backtest(code)
-
         return vol_5ma, vol_yest, price_5ma, win_rate, avg_ret, avg_amp
     except: 
         return 0, 0, 0, 0, 0, 0
@@ -410,6 +490,8 @@ def get_dynamic_thresholds(price):
 
 def _calc_est_vol(current_vol):
     now = datetime.now(timezone.utc) + timedelta(hours=8)
+    if now.weekday() >= 5: return current_vol
+    
     market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
     if now < market_open: return 0
     elapsed_minutes = (now - market_open).seconds / 60
@@ -418,27 +500,26 @@ def _calc_est_vol(current_vol):
     weight = 2.0 if elapsed_minutes < 15 else 1.0
     return int(current_vol * (270 / elapsed_minutes) / weight)
 
-def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots):
+def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdown, price, vwap, has_attacked, now_time, vol_lots, twii_slope=0.0):
     if is_breakdown: return "🚨撤退"
-    if pct >= 9.5: return "👑漲停"
-    
+    if pct >= 9.30: return "👑漲停"
     if now_time.time() < dt_time(9, 5): return "⏳暖機"
 
+    # --- 新增防禦機制 ---
+    if twii_slope < -10.0: return "⚖️觀望(盤勢險峻)"
+    if pct < 0 and twii_slope < 5.0: return "👀跌深反彈"
+    # -------------------
+
     in_golden_zone = False
-    if is_bullish and price <= (vwap * 1.015):
+    if is_bullish and price <= (vwap * 1.006):
         in_golden_zone = True
 
     if ratio >= thresholds['tgt_ratio']:
-        if in_golden_zone and net_1h > 0:
-            return "🔥攻擊"
-        elif net_1h < 0:
-            return "💀出貨"
+        if in_golden_zone and net_1h > 0: return "🔥攻擊"
+        elif net_1h < 0: return "💀出貨"
         
-    if not is_bullish:
-        return "📉線下"
-        
-    if is_bullish and not in_golden_zone:
-         return "⚠️追高"
+    if not is_bullish: return "📉線下"
+    if is_bullish and not in_golden_zone: return "⚠️追高"
 
     bias = ((price - vwap) / vwap) * 100 if vwap > 0 else 0
     if bias > thresholds['overheat']: return "⚠️過熱"
@@ -448,11 +529,107 @@ def check_signal(pct, is_bullish, net_day, net_1h, ratio, thresholds, is_breakdo
         
     if pct > 2.0 and net_1h < 0: return "❌誘多"
     if pct >= thresholds['tgt_pct']: return "⚠️價強"
-    
+
     return "盤整"
 
 # ==========================================
-# 5. Notification
+# 5. GPT Advisor
+# ==========================================
+class GPTAdvisor:
+    def __init__(self, api_key):
+        self.api_key = api_key
+    
+    def analyze_signal(self, event: SniperEvent):
+        if not self.api_key: return "⚠️ 未設定 OpenAI Key"
+        
+        try:
+            code = event.code
+            suffix = ".TW"
+            if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
+            full_code = f"{code}{suffix}"
+            
+            df_intra = yf.download(full_code, period="1d", interval="5m", progress=False, auto_adjust=True)
+            intra_str = "No Data"
+            if not df_intra.empty:
+                tail_data = df_intra.tail(12) 
+                intra_str = tail_data[['Close', 'Volume']].to_string(header=False)
+            
+            df_daily = yf.download(full_code, period="5d", progress=False, auto_adjust=True)
+            daily_str = "No Data"
+            if not df_daily.empty:
+                if isinstance(df_daily.columns, pd.MultiIndex): df_daily.columns = df_daily.columns.get_level_values(0)
+                daily_str = df_daily[['Close', 'Volume']].to_string()
+
+            inst_str = "No Data"
+            try:
+                stock = twstock.Stock(code)
+                inst_data = stock.institutional_investors 
+                if inst_data:
+                    recent_inst = inst_data[-3:] 
+                    inst_str = "\n".join([f"{d['date']}: Foreign:{d['foreign_diff']} Investment:{d['investment_trust_diff']} Dealer:{d['dealer_diff']}" for d in recent_inst])
+            except: pass
+
+            news_str = "No News"
+            try:
+                ticker = yf.Ticker(full_code)
+                news = ticker.news
+                if news:
+                    news_titles = [n.get('title', '') for n in news[:3]]
+                    news_str = "\n".join(news_titles)
+            except: pass
+            
+            prompt = f"""
+You are a top-tier day trading commander. Analyze the following data for stock {code} ({event.name}).
+Current Signal: {event.event_label} at Price {event.price}.
+
+[Advanced Technical Indicators]
+- RSI (14-day): {event.rsi} (Reference: >60 Bullish, >80 Overbought)
+- Bollinger Band Ratio: {event.band_ratio} (Reference: >1.0 indicates expanding bands/increasing volatility)
+- Bollinger %b: {event.b_percent} (Reference: 1.0 means price is at the upper band, >1.0 is a breakout)
+
+[Context Data]
+1. Recent 5 Days (Daily):
+{daily_str}
+
+2. Intraday Trend (Last 1 Hour 5m Bars):
+{intra_str}
+
+3. Institutional Investors (Foreign/Investment Trust/Dealer) Net Buy/Sell (Last 3 Days):
+{inst_str}
+
+4. Recent News Headlines:
+{news_str}
+
+[Task]
+Based on the signal, price action, chip flow, and the Advanced Technical Indicators provided, determine the immediate operation:
+- ACTION: [BUY / SELL / WAIT]
+- REASON: (Short explanation under 50 words focusing on chips, trend, and the new indicators)
+- WARNING: (Any risk factor)
+
+Reply in Traditional Chinese (繁體中文). Be concise and military style.
+"""
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 150,
+                "temperature": 0.5
+            }
+            
+            resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=10)
+            if resp.status_code == 200:
+                result = resp.json()['choices'][0]['message']['content']
+                return result
+            else:
+                return f"GPT Error: {resp.status_code}"
+        except Exception as e:
+            return f"GPT Analysis Failed: {str(e)}"
+
+# ==========================================
+# 6. Notification
 # ==========================================
 class NotificationManager:
     COOLDOWN_SECONDS = 600
@@ -461,13 +638,14 @@ class NotificationManager:
         "🔥攻擊": "🚀", "💣伏擊": "💣", "👀量增": "👀",
         "💀出貨": "💀", "🚨撤退": "⚠️", "👑漲停": "👑",
         "⚠️價強": "💪", "❌誘多": "🎣", "🔥尾盤": "🔥",
-        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉", "⚠️追高": "🚫"
+        "⚠️過熱": "🚫", "⏳暖機": "⏳", "📉線下": "📉", "⚠️追高": "🚫",
     }
 
     def __init__(self):
         self._queue = queue.Queue()
         self._cooldowns = {}
-        threading.Thread(target=self._worker_loop, daemon=True).start()
+        self.gpt_advisor = GPTAdvisor(OPENAI_API_KEY)
+        threading.Thread(target=self._worker_loop, daemon=True, name="NotificationThread").start()
 
     def reset_daily_state(self):
         self._cooldowns.clear()
@@ -475,26 +653,31 @@ class NotificationManager:
     def should_notify(self, event: SniperEvent) -> bool:
         if event.is_test: return True
         if not MarketSession.is_market_open(): return False
+
+        # --- 【新增：09:25 靜音閘門】 ---
+        # 取得當前台北時間 (HHMM 格式)
+        now_hhmm = int((datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H%M'))
+        if now_hhmm < 925:
+            # 雖然不推播，但因為這是在 should_notify 內判斷
+            # 只要 fetch_stock 裡有呼叫 db.log_telegram，數據依然會進雲端！
+            return False 
+        # -----------------------------
         
         if event.scope == "watchlist" and event.event_label == "🔥攻擊":
-            if event.win_rate < 50:
-                return False
+            if event.win_rate < 50: return False
 
-        if event.event_label == "⚠️追高":
-            return False
+        if event.event_label == "⚠️追高": return False
 
         key = f"{event.code}_{event.scope}_{event.event_label}"
         
         if event.scope == "inventory":
-            if event.event_label not in ["💀出貨", "🚨撤退", "🔥攻擊", "👑漲停"]:
-                return False
+            if event.event_label not in ["💀出貨", "🚨撤退", "🔥攻擊", "👑漲停"]: return False
             if "撤退" in event.event_label:
                  if time.time() - self._cooldowns.get(key, 0) < 300: return False
                  return True
 
         if event.scope == "watchlist":
-            if event.event_label != "🔥攻擊":
-                return False
+            if event.event_label != "🔥攻擊": return False
 
         if time.time() - self._cooldowns.get(key, 0) < self.COOLDOWN_SECONDS: return False
         return True
@@ -509,6 +692,9 @@ class NotificationManager:
             event = self._queue.get()
             try:
                 self._send_telegram(event)
+                if OPENAI_API_KEY and event.event_label in ["🔥攻擊", "🔥尾盤", "💀出貨"]:
+                    gpt_analysis = self.gpt_advisor.analyze_signal(event)
+                    self._send_telegram_gpt(event.code, gpt_analysis)
                 time.sleep(self.RATE_LIMIT_DELAY)
             except: pass
             finally: self._queue.task_done()
@@ -525,13 +711,22 @@ class NotificationManager:
                f"💰 大戶：{event.net_10m} / <b>{event.net_1h}</b> / {event.net_day}")
                
         buttons = [[{"text": "📈 Yahoo", "url": f"https://tw.stock.yahoo.com/quote/{event.code}.TW"}]]
-        try: requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "reply_markup": json.dumps({"inline_keyboard": buttons})}, timeout=5)
+        try: 
+            resp = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "reply_markup": json.dumps({"inline_keyboard": buttons})}, timeout=5)
+            if resp.status_code == 200:
+                db.log_telegram(event)
+        except: pass
+
+    def _send_telegram_gpt(self, code, analysis_text):
+        if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+        msg = f"<b>🤖 AI 戰略顧問｜{code}</b>\n\n{analysis_text}"
+        try: requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
         except: pass
 
 notification_manager = NotificationManager()
 
 # ==========================================
-# 6. Engine (Sniper Core)
+# 7. Engine (Sniper Core - Cloud Hardened)
 # ==========================================
 class SniperEngine:
     def __init__(self):
@@ -547,11 +742,14 @@ class SniperEngine:
         self.active_flags = {}
         self.daily_risk_flags = {}
         self.wave_tracker = {}
+        self.adv_indicator_cache = {} 
         
-        self.market_stats = {"Time": 0, "Price5MA": 0} 
+        self.market_stats = {"Time": 0, "Price5MA": 0, "Slope5Min": 0.0, "PriceHistory": []} 
         self.twii_data = None 
         self.last_reset = datetime.now().date()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
+        self.last_snapshot_ts = 0
+        
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         self._init_market_stats()
 
     def update_targets(self):
@@ -565,7 +763,8 @@ class SniperEngine:
         if self.running: return
         self.update_targets()
         self.running = True
-        threading.Thread(target=self._run_loop, daemon=True).start()
+        thread = threading.Thread(target=self._run_loop, daemon=True, name="SniperCoreThread")
+        thread.start()
 
     def stop(self): self.running = False
     
@@ -573,17 +772,17 @@ class SniperEngine:
         try:
              tse = yf.Ticker("^TWII")
              hist = tse.history(period="10d", auto_adjust=True)
-             if not hist.empty:
-                 self.market_stats["Price5MA"] = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
-             else:
-                 self.market_stats["Price5MA"] = 0
+             if not hist.empty: self.market_stats["Price5MA"] = hist['Close'].iloc[-6:-1].mean() if len(hist) >= 6 else hist['Close'].mean()
+             else: self.market_stats["Price5MA"] = 0
         except: pass
 
     def _update_market_thermometer(self):
-        if time.time() - self.market_stats.get("Time", 0) < 3: return
+        current_ts = time.time()
+        if current_ts - self.market_stats.get("Time", 0) < 15: return
+        
         current_price = 0; current_pct = 0
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M:%S')
-        source_status = f"{now_str} (Crawler)"
+        source_status = f"{now_str}"
 
         try:
             url = "https://tw.stock.yahoo.com/quote/^TWII"
@@ -611,21 +810,111 @@ class SniperEngine:
             except: pass
 
         if current_price:
-             price_5ma = self.market_stats.get("Price5MA", current_price)
-             self.twii_data = {
+            if "PriceHistory" not in self.market_stats:
+                self.market_stats["PriceHistory"] = []
+            
+            self.market_stats["PriceHistory"].append((current_ts, current_price))
+            self.market_stats["PriceHistory"] = [x for x in self.market_stats["PriceHistory"] if current_ts - x[0] <= 600]
+            
+            past_price = current_price
+            for ts, p in self.market_stats["PriceHistory"]:
+                if current_ts - ts <= 300:
+                    past_price = p
+                    break
+            
+            slope_5min = float(current_price - past_price)
+            self.market_stats["Slope5Min"] = slope_5min
+            price_5ma = self.market_stats.get("Price5MA", current_price)
+            
+            # 👇 補足 vol 欄位以供儀表板運算
+            self.twii_data = {
                 'code': '0000', 'name': f'加權指數 {source_status}', 
+                'vol': 0,
                 'price': current_price, 'pct': current_pct, 'vwap': current_price, 
                 'price_5ma': price_5ma, 'ratio': 1.0, 'ratio_yest': 1.0,
                 'net_10m': 0, 'net_1h': 0, 'net_day': 0,
                 'situation': '市場指標', 'event_label': '大盤',
-                'is_pinned': 1, 'win_rate': 0, 'avg_ret': 0, 'avg_amp': 0, 'active_light': 1
+                'is_pinned': 1, 'win_rate': 0, 'avg_ret': 0, 'avg_amp': 0, 'active_light': 1,
+                'twii_slope': slope_5min,
+                'rsi': 0.0, 'band_ratio': 0.0, 'b_percent': 0.0
             }
-             self.market_stats["Time"] = time.time()
+            self.market_stats["Time"] = current_ts
 
     def _dispatch_event(self, ev: SniperEvent):
         notification_manager.enqueue(ev)
 
-    def _fetch_stock(self, code, now_time=None):
+    def _calculate_advanced_indicators(self, code):
+        try:
+            # --- [機制 1] 隨機節流：避免多線程同時向 Yahoo 擊發 ---
+            import random
+            time.sleep(random.uniform(0.5, 3.0))
+            
+            # --- [機制 2] 延長快取：整備月指標每 30 分鐘更新一次即可 (節省 80% 流量) ---
+            now_ts = time.time()
+            if code in self.adv_indicator_cache:
+                # 判斷快取時間 (600 秒 = 10 分鐘)
+                if (now_ts - self.adv_indicator_cache[code].get('time', 0)) < 600:
+                    c = self.adv_indicator_cache[code]
+                    return c['rsi'], c['br'], c['bp']
+
+            # --- [機制 3] 標記故障：針對經常喷錯的標的進行隔離 ---
+            if not hasattr(self, 'indicator_fail_count'): self.indicator_fail_count = {}
+            if self.indicator_fail_count.get(code, 0) >= 3:
+                return 0.0, 0.0, 0.0
+
+            suffix = ".TW"
+            if code in twstock.codes and twstock.codes[code].market == '上櫃': suffix = ".TWO"
+            full_code = f"{code}{suffix}"
+            
+            # 抓取資料 (縮短 period 到 1mo 減少資料傳輸量，計算 RSI 14 仍夠用)
+            ticker = yf.Ticker(full_code)
+            df = ticker.history(period="3mo", interval="1d", auto_adjust=True)
+            
+            if df.empty or len(df) < 25: 
+                log_debug(f"⚠️ [{code}] 指標失敗：歷史資料不足")
+                return 0.0, 0.0, 0.0
+                
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+
+            # 技術指標計算
+            rsi_series = ta.rsi(df['Close'], length=14)
+            df['RSI_14'] = rsi_series if rsi_series is not None else 0.0
+
+            df['BBM_20_2.0'] = df['Close'].rolling(window=20).mean()
+            std = df['Close'].rolling(window=20).std(ddof=0)
+            df['BBU_20_2.0'] = df['BBM_20_2.0'] + (2 * std)
+            df['BBL_20_2.0'] = df['BBM_20_2.0'] - (2 * std)
+            df['BBB_20_2.0'] = (df['BBU_20_2.0'] - df['BBL_20_2.0']) / df['BBM_20_2.0']
+            df['Band_Ratio'] = (df['BBB_20_2.0'] / df['BBB_20_2.0'].rolling(window=5).max().shift(1)).round(3)
+            df['%b'] = ((df['Close'] - df['BBL_20_2.0']) / (df['BBU_20_2.0'] - df['BBL_20_2.0'])).round(3)
+            
+            latest = df.iloc[-1]
+            rsi_val = float(latest.get('RSI_14', 0.0))
+            band_ratio_val = float(latest.get('Band_Ratio', 0.0))
+            b_percent_val = float(latest.get('%b', 0.0))
+
+            if math.isnan(rsi_val): rsi_val = 0.0
+            if math.isnan(band_ratio_val): band_ratio_val = 0.0
+            if math.isnan(b_percent_val): b_percent_val = 0.0
+
+            # 更新快取
+            self.adv_indicator_cache[code] = {'time': now_ts, 'rsi': rsi_val, 'br': band_ratio_val, 'bp': b_percent_val}
+            # 成功時歸零失敗計數
+            self.indicator_fail_count[code] = 0
+
+            log_debug(f"✅ [{code}] 指標更新成功 (Cache 啟動)")
+            return round(rsi_val, 1), round(band_ratio_val, 2), round(b_percent_val, 2)
+
+        except Exception as e:
+            err_msg = str(e)
+            if "Too Many Requests" in err_msg:
+                self.indicator_fail_count[code] = self.indicator_fail_count.get(code, 0) + 1
+                log_debug(f"🛑 [{code}] Yahoo 限制流量中，失敗次數: {self.indicator_fail_count[code]}")
+            else:
+                log_debug(f"💥 [{code}] 指標嚴重例外：{err_msg}")
+            return 0.0, 0.0, 0.0
+
+    def _fetch_stock(self, code, now_time=None, force_snapshot=False):
         try:
             if now_time is None: now_time = datetime.now(timezone.utc) + timedelta(hours=8)
             client = next(self.client_cycle) if self.client_cycle else None
@@ -685,13 +974,8 @@ class SniperEngine:
             if net_1h > 0: situation = "🔥主動吸籌" if is_bullish else "🛡️被動吃盤"
             elif net_1h < 0: situation = "💀主動倒貨" if not is_bullish else "🎣拉高出貨"
 
-            # === [核心升級] 時間冷卻波次計數器 ===
             if code not in self.wave_tracker:
-                self.wave_tracker[code] = {
-                    'count': 0,
-                    'last_trigger_ts': 0,
-                    'is_holding': False 
-                }
+                self.wave_tracker[code] = {'count': 0, 'last_trigger_ts': 0, 'is_holding': False}
 
             entry_threshold = vwap * 1.005
             tracker = self.wave_tracker[code]
@@ -723,8 +1007,9 @@ class SniperEngine:
             if time_ok and wave_ok and pct_ok and ceiling_ok and threshold_ok:
                 active_light = 1
 
+            current_twii_slope = self.market_stats.get("Slope5Min", 0.0)
             thresholds = get_dynamic_thresholds(price)
-            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots)
+            raw_state = check_signal(pct, is_bullish, net_day, net_1h, ratio_5ma, thresholds, is_breakdown, price, vwap, code in self.active_flags, now_time, vol_lots, twii_slope=current_twii_slope)
 
             event_label = None
             scope = "inventory" if code in self.inventory_codes else "watchlist"
@@ -738,58 +1023,150 @@ class SniperEngine:
             elif "出貨" in raw_state and code not in self.daily_risk_flags and scope == "inventory": event_label = "💀出貨"
             elif "尾盤" in raw_state: event_label = "🔥尾盤"
 
+            if code not in self.adv_indicator_cache or (now_ts - self.adv_indicator_cache[code].get('time', 0)) > 300:
+                c_rsi, c_br, c_bp = self._calculate_advanced_indicators(code)
+                self.adv_indicator_cache[code] = {'time': now_ts, 'rsi': c_rsi, 'br': c_br, 'bp': c_bp}
+
+            rsi_val = self.adv_indicator_cache[code].get('rsi', 0.0)
+            band_ratio_val = self.adv_indicator_cache[code].get('br', 0.0)
+            b_percent_val = self.adv_indicator_cache[code].get('bp', 0.0)
+            ctrl_ratio = (net_day / vol_lots * 100) if vol_lots > 0 else 0
+            
             if event_label:
                 if "攻擊" in event_label: self.active_flags[code] = True
                 if "出貨" in event_label or "撤退" in event_label: self.daily_risk_flags[code] = True
-                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate)
+                
+                ev = SniperEvent(code=code, name=get_stock_name(code), scope=scope, event_kind="STRATEGY", event_label=event_label, price=price, pct=pct, vwap=vwap, ratio=ratio_5ma, ratio_yest=ratio_yest, net_10m=net_10m, net_1h=net_1h, net_day=net_day, tp_price=tp_calc, sl_price=sl_calc, win_rate=win_rate, twii_slope=current_twii_slope, rsi=rsi_val, band_ratio=band_ratio_val, b_percent=b_percent_val, control_ratio=ctrl_ratio, is_snapshot=False)
                 self._dispatch_event(ev)
+                db.log_telegram(ev)
 
-            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light)
-        except: return None
+            # [新增] 5分鐘定時快照紀錄
+            # 建議修正為：
+            # --- [修正後的 SNAPSHOT 強制紀錄邏輯] ---
+            if force_snapshot:
+                # 判斷標籤：如果有訊號就標註 SNAPSHOT_攻擊，沒訊號就單純 SNAPSHOT
+                snap_label = "SNAPSHOT" if not event_label else f"SNAPSHOT_{event_label}"
+                
+                ev_snap = SniperEvent(
+                    code=code, 
+                    name=get_stock_name(code), 
+                    scope=scope, 
+                    event_kind="SNAPSHOT", 
+                    event_label=snap_label, 
+                    price=price, 
+                    pct=pct, 
+                    vwap=vwap, 
+                    ratio=ratio_5ma, 
+                    ratio_yest=ratio_yest, 
+                    net_10m=net_10m, 
+                    net_1h=net_1h, 
+                    net_day=net_day, 
+                    tp_price=0, 
+                    sl_price=0, 
+                    win_rate=win_rate, 
+                    twii_slope=current_twii_slope, 
+                    rsi=rsi_val, 
+                    band_ratio=band_ratio_val, 
+                    b_percent=b_percent_val, 
+                    control_ratio=ctrl_ratio, 
+                    is_snapshot=True
+                )
+                db.log_telegram(ev_snap)
+            # ---------------------------------------
+
+            return (code, get_stock_name(code), "一般", price, pct, vwap, vol_lots, est_lots, ratio_5ma, net_1h, net_day, raw_state, now_ts, "DATA_OK", "B", "NORMAL", net_10m, situation, ratio_yest, active_light, rsi_val, band_ratio_val, b_percent_val)
+        except Exception as e:
+            return None
 
     def _run_loop(self):
+        log_debug(">>> Sniper Engine Loop Started")
+        fail_count = 0
         while self.running:
             try:
                 now = datetime.now(timezone.utc) + timedelta(hours=8)
+                current_ts = time.time()
+                
+                # --- 新增：5分鐘快照觸發器 ---
+                # --- [修正後的動態採樣頻率] ---
+                do_snapshot = False
+                if MarketSession.is_market_open(now):
+                    # 取得當前台北時間 (HHMM 格式)
+                    now_hhmm = int(now.strftime('%H%M'))
+                    
+                    # 策略：09:00 - 09:15 採樣間隔為 60 秒；其餘時間 300 秒
+                    interval = 60 if now_hhmm <= 915 else 300
+                    
+                    if (current_ts - self.last_snapshot_ts >= interval):
+                        do_snapshot = True
+                        self.last_snapshot_ts = current_ts
+                        log_debug(f"📸 執行 {interval} 秒定時採樣 (目標 15 檔全覆蓋)...")
+
                 if now.date() > self.last_reset:
-                    self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}
+                    self.active_flags = {}; self.daily_risk_flags = {}; self.daily_net = {}; self.prev_data = {}; self.vol_queues = {}; self.base_vol_cache = {}; self.wave_tracker = {}; self.adv_indicator_cache = {}
                     notification_manager.reset_daily_state()
+                    db.write_queue.put(('execute', 'DELETE FROM telegram_logs', ()))
                     self.last_reset = now.date()
+                    log_debug(f"[{now}] Daily Reset Complete")
+                    self.update_targets()
 
                 self._update_market_thermometer()
+                
                 targets = db.get_all_codes()
                 self.inventory_codes = db.get_inventory_codes()
                 pinned_codes = db.get_pinned_codes()
-                if not targets: time.sleep(2); continue
+                
+                if not targets: 
+                    time.sleep(2)
+                    continue
 
                 inv_set = set(self.inventory_codes); pin_set = set(pinned_codes)
                 def priority_key(code): return 0 if code in inv_set else 1 if code in pin_set else 2
                 targets.sort(key=priority_key)
 
                 batch = []
-                futures = [self.executor.submit(self._fetch_stock, c, now) for c in targets]
+                # [修改] 傳入 force_snapshot
+                futures = {self.executor.submit(self._fetch_stock, c, now, force_snapshot=do_snapshot): c for c in targets}
+                
                 for f in concurrent.futures.as_completed(futures):
-                    if f.result(): batch.append(f.result())
-                db.upsert_realtime_batch(batch)
-                time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
-            except Exception as e:
-                print(f"Engine Loop Error: {e}")
-                time.sleep(5)
+                    try:
+                        result = f.result(timeout=10)
+                        if result: batch.append(result)
+                    except: pass
 
-if "sniper_engine_core" not in st.session_state: st.session_state.sniper_engine_core = SniperEngine()
-engine = st.session_state.sniper_engine_core
+                db.upsert_realtime_batch(batch)
+                fail_count = 0 
+                time.sleep(1.5 if MarketSession.is_market_open(now) else 5)
+
+            except Exception as e:
+                fail_count += 1
+                log_debug(f"⚠️ [Engine Critical Error] {e}")
+                time.sleep(min(30, 2 ** fail_count))
+                try:
+                    self.executor.shutdown(wait=False)
+                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+                except: pass
 
 # ==========================================
-# 7. UI (Table Layout)
+# [雲端核心] 全域引擎單例綁定
+# ==========================================
+@st.cache_resource
+def get_sniper_engine():
+    return SniperEngine()
+
+engine = get_sniper_engine()
+
+# ==========================================
+# 8. UI (Table Layout)
 # ==========================================
 def render_streamlit_ui():
     with st.sidebar:
-        st.title("🛡️ 戰情室 v6.16.15 BuySignal")
+        st.title("🛡️ 戰情室 v6.16.15 Cloud Commander")
         st.caption(f"Update: {datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
         st.markdown("---")
 
         mode = st.radio("身分模式", ["👀 戰情官", "👨‍✈️ 指揮官"])
-        use_filter = st.checkbox("只看局勢活躍 (>70元)")
+        # 👇 實裝菁英過濾開關
+        use_elite_filter = st.checkbox("👑 菁英過濾協議 (>70元 & 總量>3000張)")
 
         if mode == "👨‍✈️ 指揮官":
             with st.expander("📦 庫存管理", expanded=False):
@@ -825,14 +1202,46 @@ def render_streamlit_ui():
                         status.update(label="戰略數據建立完成！", state="complete")
                         st.rerun()
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("🟢 啟動監控", disabled=engine.running):
-                        engine.start(); st.toast("核心已啟動"); st.rerun()
-                with col_b:
-                    if st.button("🔴 停止監控", disabled=not engine.running):
-                        engine.stop(); st.toast("核心已停止"); st.rerun()
+            with st.expander("📥 戰情報告 (推播 LOG 下載)", expanded=False):
+                st.caption("自動記錄當日 Telegram 推播歷史，包含當下價格、籌碼、大盤斜率與技術指標(RSI等)。")
+                logs_df = db.get_telegram_logs()
+                if not logs_df.empty:
+                    st.dataframe(logs_df.tail(10), hide_index=True) 
+                    csv = logs_df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label="📥 下載今日推播 LOG (CSV)",
+                        data=csv,
+                        file_name=f"sniper_telegram_logs_{datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d')}.csv",
+                        mime='text/csv'
+                    )
+                else:
+                    st.info("尚無推播紀錄")
+
+            with st.expander("🛠️ 系統除錯日誌 (Debug Logs)", expanded=False):
+                st.caption("即時監控背景引擎的運作狀態與報錯。")
+                if st.button("🔄 刷新日誌"): st.rerun()
+                log_text = "\n".join(sys_debug_logs) if sys_debug_logs else "目前無除錯訊息..."
+                st.text_area("終端機輸出", value=log_text, height=200, disabled=True)
+
+            st.markdown("---")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("🟢 啟動監控", disabled=engine.running):
+                    engine.start(); st.toast("核心已啟動"); st.rerun()
+            with col_b:
+                if st.button("🔴 停止監控", disabled=not engine.running):
+                    engine.stop(); st.toast("核心已停止"); st.rerun()
+        
         st.caption(f"Engine: {'🟢 RUNNING' if engine.running else '🔴 STOPPED'}")
+        
+        if not engine.running and "auto_started" not in st.session_state:
+            st.warning("⚠️ 偵測到核心停止，嘗試自動重啟...")
+            try:
+                engine.start()
+                st.session_state.auto_started = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"重啟失敗: {e}")
 
     try:
         from streamlit import fragment
@@ -850,14 +1259,9 @@ def render_streamlit_ui():
             return decorator
 
     @fragment(run_every=1.5)
+    @fragment(run_every=1.5)
     def render_live_dashboard():
-        with st.expander("📦 庫存戰況 (Inventory)", expanded=False):
-            df_inv = db.get_inventory_view()
-            if not df_inv.empty:
-                st.dataframe(df_inv[['code', 'name', 'situation', 'price', 'pct', 'profit_val', 'signal_level']], hide_index=True)
-            else: st.info("尚無庫存")
-
-        st.markdown("---")
+        # 👇 庫存戰況 UI 已徹底抹除，直接進入精銳監控
         st.subheader("⚔️ 精銳監控 (Tactical Table)")
         df_watch = db.get_watchlist_view()
         
@@ -871,12 +1275,15 @@ def render_streamlit_ui():
 
         if df_watch.empty: st.info("尚未加入監控標的"); return
 
-        numeric_cols = ['price', 'pct', 'vwap', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp']
+        numeric_cols = ['price', 'pct', 'vwap', 'vol', 'ratio', 'ratio_yest', 'net_10m', 'net_1h', 'net_day', 'price_5ma', 'win_rate', 'avg_ret', 'active_light', 'avg_amp', 'twii_slope', 'rsi', 'band_ratio', 'b_percent']
         for col in numeric_cols:
             if col in df_watch.columns: df_watch[col] = pd.to_numeric(df_watch[col], errors='coerce').fillna(0.0)
 
-        if use_filter: df_watch = df_watch[df_watch['price'] > 70]
+        # 👇 執行菁英過濾協議 (大盤 0000 絕對保留)
+        if use_elite_filter: 
+            df_watch = df_watch[(df_watch['code'] == '0000') | ((df_watch['price'] > 70) & (df_watch['vol'] >= 3000))]
 
+        # 👇 下方維持原本的 HTML 表格渲染邏輯不變
         table_start = """
     <style>
     table.sniper-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; }
@@ -889,8 +1296,8 @@ def render_streamlit_ui():
     <table class="sniper-table">
     <thead>
     <tr>
-    <th>📌</th><th>代碼</th><th>名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
-    <th>均價 (燈/Buy/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th>
+    <th>📌</th><th>代碼/名稱 (Link)</th><th>訊號</th><th>5MA</th><th>現價</th><th>漲跌%</th>
+    <th>均價 (燈/Buy/TP/SL)</th><th>量比 (昨/5日)</th><th>局勢</th><th>大戶 (10m/1H/日)</th><th>指標(RSI/BW/%b)</th>
     </tr>
     </thead>
     <tbody>
@@ -904,91 +1311,100 @@ def render_streamlit_ui():
             pin_icon = "📌" if is_pinned else ""
             is_twii = str(row['code']) == "0000"
 
-            # [NEW FORMAT LOGIC]
             win_rate = row.get("win_rate", 0)
             avg_ret = row.get("avg_ret", 0)
             avg_amp = row.get("avg_amp", 0)
-            
-            name_part = row['name']
-            if not is_twii:
-                name_part = f"{row['name']} ({win_rate:.0f}%, Exp{avg_ret:+.2f})"
-                if win_rate < 50: name_part += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
-                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_part += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
 
-            # 1. Price
             main_color = "#ff4d4f" if row['pct'] > 0 else "#2ecc71" if row['pct'] < 0 else "#999999"
             price_html = f"<span style='color:{main_color}; font-weight:bold'>{row['price']:.2f}</span>"
             pct_html = f"<span style='color:{main_color}'>{row['pct']:.2f}%</span>"
 
-            # 2. VWAP Light (Strict Logic from DB)
             active_light = row.get('active_light', 0)
             vwap_color = "#ff4d4f" if row['price'] >= row['vwap'] else "#2ecc71"
             
+            rsi_val = row.get('rsi', 0.0)
+            br_val = row.get('band_ratio', 0.0)
+            bp_val = row.get('b_percent', 0.0)
+
+            if rsi_val > 0: indicators_html = f"<span style='font-size:0.85em; color:#555;'>{rsi_val:.1f} / {br_val:.2f} / {bp_val:.2f}</span>"
+            else: indicators_html = "<span style='color:#777'>-</span>"
+
             if is_twii: 
-                vwap_light = ""
-                buy_html = ""
+                twii_slope = float(row.get('twii_slope', 0.0))
+                slope_color = "#2ecc71" if twii_slope > 0 else "#ff4d4f" if twii_slope < 0 else "#999999"
+                slope_light = "🟢" if twii_slope > 0 else "🔴" if twii_slope < 0 else "⚪"
+                
+                name_html = f'<span style="font-weight:bold;">{row["code"]} {row["name"]}</span>'
+                vwap_html = f"<span style='color:{slope_color}; font-weight:bold'>5m斜率: {twii_slope:+.2f}</span>"
+                ratio_html = "<span style='color:#777'>-</span>"
+                situation_text = "趨勢向上" if twii_slope > 0 else "趨勢向下" if twii_slope < 0 else "橫盤"
+                situation_html = f"<span style='color:{slope_color}; font-weight:bold'>{situation_text} {slope_light}</span>"
+                bp_html = "<span style='color:#777'>- / - / -<br>(-%)</span>"
+
             else:
+                # 垂直整合 代碼/名稱/回測數據
+                name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold; font-size:16px;">{row["code"]} {row["name"]}</a><br><span style="font-size:0.85em; color:#888;">({win_rate:.0f}%, Exp{avg_ret:+.2f})</span>'
+                if win_rate < 50: name_html += " <span style='color:#ff4d4f; font-size:0.8em;'>(高風險)</span>"
+                if avg_amp >= MIN_AMPLITUDE_THRESHOLD: name_html += " <span style='color:#e67e22; font-weight:bold;'>(瘋)</span>"
+
                 if active_light == 1: vwap_light = "🟢"
                 else: vwap_light = "🔴"
-                
-                # Calculate Buy Price (Trigger) for display
                 trigger_val = row['vwap'] * 1.005
                 buy_price = adjust_to_tick(trigger_val, method='round')
                 buy_html = f"<span style='color:#e67e22; font-weight:bold; margin-left:4px;'>Buy:{buy_price:.2f}</span>"
-            
-            vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span> {buy_html}"
-            
-            if not is_twii:
+                vwap_html = f"<span style='color:{vwap_color}'>{row['vwap']:.2f} {vwap_light}</span> {buy_html}"
+                
                 trigger_price = row['vwap'] * 1.005
                 tp_price = adjust_to_tick(trigger_price * 1.02, method='round')
                 sl_price = adjust_to_tick(row['vwap'] * 0.985, method='floor')
                 vwap_html += f"<br><span style='font-size:0.85em; color:#888'>(TP:{tp_price:.1f} / SL:{sl_price:.1f})</span>"
 
-            # 3. 5MA
-            p_5ma = row.get('price_5ma', 0)
-            c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
-            ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
+                thresholds = get_dynamic_thresholds(row['price'])
+                r_yest = row.get('ratio_yest', 0); r_5ma = row['ratio']
+                is_vol_strong = r_5ma >= thresholds['tgt_ratio']
+                vol_light = "🟢" if is_vol_strong else "🔴"
+                c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
+                ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
 
-            # 4. Volume
-            thresholds = get_dynamic_thresholds(row['price'])
-            r_yest = row.get('ratio_yest', 0); r_5ma = row['ratio']
-            is_vol_strong = r_5ma >= thresholds['tgt_ratio']
-            vol_light = "🟢" if is_vol_strong else "🔴"
-            c_5ma_r = "#ff4d4f" if is_vol_strong else "#999999"
-            ratio_html = f"{r_yest:.1f} / <span style='color:{c_5ma_r}; font-weight:bold'>{r_5ma:.1f} {vol_light}</span>"
+                sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
+                clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
+                situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
 
-            # 5. Situation
-            sit_color = "#ff4d4f" if "吸籌" in situation or "攻擊" in situation else "#2ecc71" if "倒貨" in situation else "#e67e22" if "吃盤" in situation else "#999999"
-            clean_situation = situation.replace("🔥", "").replace("🛡️", "").replace("💀", "").replace("🎣", "").replace("⚖️", "")
-            situation_html = f"<span style='color:{sit_color}; font-weight:bold'>{clean_situation}</span>"
-            
-            # 6. Link
-            if is_twii: name_html = f'<span style="font-weight:bold;">{name_part}</span>'
-            else: name_html = f'<a href="https://tw.stock.yahoo.com/quote/{row["code"]}.TW" target="_blank" style="text-decoration:none; color:#3498db; font-weight:bold;">{name_part}</a>'
+                # 提取數據並計算大戶控盤比 (%)
+                n10 = int(row.get('net_10m', 0))
+                n1h = int(row.get('net_1h', 0))
+                nd = int(row.get('net_day', 0))
+                vol = float(row.get('vol', 0))
 
-            # 7. Big Player
-            if is_twii: bp_html = "<span style='color:#777'>- / - / -</span>"
-            else:
-                n10 = int(row['net_10m']); n1h = int(row['net_1h']); nd = int(row['net_day'])
+                chip_ratio = (nd / vol * 100) if vol > 0 else 0.0
+                chip_ratio_str = f"{chip_ratio:+.1f}%"
+                ratio_color = "#ff4d4f" if chip_ratio > 0 else "#2ecc71" if chip_ratio < 0 else "#999999"
+
                 bp_light = "🟢" if n1h > 0 else "🔴"
                 c10 = "#ff4d4f" if n10 > 0 else "#2ecc71" if n10 < 0 else "#999999"
                 c1h = "#ff4d4f" if n1h > 0 else "#2ecc71" if n1h < 0 else "#999999"
                 cd  = "#ff4d4f" if nd > 0 else "#2ecc71" if nd < 0 else "#999999"
-                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span>"
+                
+                # 組合字串，換行顯示控盤比
+                bp_html = f"<span style='color:{c10}'>{n10}</span> / <span style='color:{c1h}'>{n1h} {bp_light}</span> / <span style='color:{cd}'>{nd}</span><br><span style='color:{ratio_color}; font-size:0.9em; font-weight:bold;'>({chip_ratio_str})</span>"
 
-            is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
-            if is_three_lights: row_class = "golden-row"
-            elif is_pinned: row_class = "pinned-row"
-            else: row_class = ""
+                is_three_lights = (active_light == 1) and (vol_light == "🟢") and (bp_light == "🟢")
+                if is_three_lights: row_class = "golden-row"
+                elif is_pinned: row_class = "pinned-row"
+                else: row_class = ""
 
-            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{row["code"]}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td></tr>')
+            p_5ma = row.get('price_5ma', 0)
+            c_5ma = "#ff4d4f" if row['price'] > p_5ma else "#2ecc71"
+            ma_html = f"<span style='color:{c_5ma}'>{p_5ma:.2f}</span>"
+            
+            html_rows.append(f'<tr class="{row_class}"><td>{pin_icon}</td><td>{name_html}</td><td>{event_label}</td><td>{ma_html}</td><td>{price_html}</td><td>{pct_html}</td><td>{vwap_html}</td><td>{ratio_html}</td><td>{situation_html}</td><td>{bp_html}</td><td>{indicators_html}</td></tr>')
 
         st.markdown(table_start + "".join(html_rows) + "</tbody></table>", unsafe_allow_html=True)
 
     render_live_dashboard()
 
 # ==========================================
-# 8. Console Backtest Mode (Restored)
+# 9. Console Backtest Mode
 # ==========================================
 def run_console_backtest(target_code):
     print(f"\n{Fore.CYAN}📡 調閱 {target_code} 過去 60 天戰報...{Style.RESET_ALL}")
@@ -1052,7 +1468,7 @@ def run_console_backtest(target_code):
             entry_line = v * ENTRY_THRESHOLD
             if p >= entry_line:
                 if not is_holding_wave:
-                    if (curr_ts - last_wave_ts) > 300: # 5 mins
+                    if (curr_ts - last_wave_ts) > 300:
                         wave_count += 1
                         last_wave_ts = curr_ts
                 is_holding_wave = True
@@ -1119,7 +1535,7 @@ def run_console_backtest(target_code):
     print(f"   平均報酬: {Fore.GREEN if avg_profit > 0 else Fore.RED}{avg_profit:+.2f}%{Style.RESET_ALL} (不含稅費)")
 
 # ==========================================
-# 9. Main Dispatcher
+# 10. Main Dispatcher
 # ==========================================
 if __name__ == "__main__":
     try:
@@ -1128,7 +1544,7 @@ if __name__ == "__main__":
             render_streamlit_ui()
         else:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (Cloud Commander){Style.RESET_ALL}")
             while True:
                 try:
                     user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
@@ -1141,7 +1557,7 @@ if __name__ == "__main__":
                 except Exception as e: print(f"錯誤: {e}")
     except ModuleNotFoundError:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (BuySignal){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔥 Sniper 回測終端機 v6.16.15 (Cloud Commander){Style.RESET_ALL}")
         while True:
             try:
                 user_input = input(f"\n請輸入股票代碼 (輸入 q 離開): ").strip().upper()
